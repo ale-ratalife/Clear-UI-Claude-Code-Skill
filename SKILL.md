@@ -1,7 +1,9 @@
 
-# Claude Local UI - Custom Skill & Codebase
+# Claude Local UI via CLI - Custom Skill & Codebase
 
-This guide provides the instructions to create a custom "Skill" for Claude and the complete Next.js codebase to spin up a local, animated, markdown-formatted chat interface identical to the provided images.
+This guide provides the instructions to create a custom "Skill" for Claude and the complete Next.js codebase to spin up a local, animated, markdown-formatted chat interface. 
+
+Instead of using an API key, this setup connects directly to your **locally installed and authenticated Claude Code CLI**, utilizing your existing Pro/Max subscription.
 
 ---
 
@@ -13,7 +15,9 @@ Save this in your Claude Custom Instructions or Projects settings.
 **Trigger:** "Inicia UI", "Start UI", "Launch interface", "a traer con", or any similar command in ANY language.
 
 **Instructions:**
-You are an expert Frontend and Fullstack Developer. When the user triggers this skill (using phrases like "Inicia UI", "Start UI", "a traer con", etc., regardless of the language they use), you must provide the complete code for a Next.js (App Router) project that replicates the Claude interface based on the provided design references.
+You are an expert Frontend and Fullstack Developer. When the user triggers this skill (using phrases like "Inicia UI", "Start UI", "a traer con", etc., regardless of the language they use), you must provide the complete code for a Next.js (App Router) project that replicates the Claude interface based on the provided design references. 
+
+**Crucial Architecture Note:** The backend must use Node.js `child_process` to communicate with the local `claude` CLI. **Do not** use the Anthropic SDK or require an API key.
 
 **UI Characteristics:**
 - **Design:** Minimalist: white/cream background, soft gray borders, Inter or system-ui typography.
@@ -22,13 +26,13 @@ You are an expert Frontend and Fullstack Developer. When the user triggers this 
 - **Input Area:** Floating text area with model selector, attachment button, and send button.
 - **Formatting:** Markdown rendering for code, lists, and bold text using `react-markdown`.
 - **Animations:** Smooth fade-in animations using `framer-motion`.
-- **Security:** Connect to the Anthropic API via a secure API route (`/api/chat`) to hide the API key.
 
 ---
 
 ## Part 2: The Code Implementation
 
-Follow these steps to build the local UI.
+### Prerequisites
+Ensure you have Claude Code installed and authenticated locally. You can test this by running `claude -p "hello"` in your terminal. If it responds, you are good to go.
 
 ### 1. Project Setup
 Open your terminal and run:
@@ -36,46 +40,63 @@ Open your terminal and run:
 npx create-next-app@latest claude-local-ui
 # Select: TypeScript (Yes), ESLint (Yes), Tailwind CSS (Yes), App Router (Yes)
 cd claude-local-ui
-npm install @anthropic-ai/sdk lucide-react framer-motion react-markdown remark-gfm
+npm install lucide-react framer-motion react-markdown remark-gfm
 ```
+*(Note: We removed `@anthropic-ai/sdk` because we are using the local CLI).*
 
-### 2. Environment Variables
-Create a `.env.local` file in the root directory and add your Anthropic API key:
-```env
-ANTHROPIC_API_KEY=your_api_key_here
-```
-
-### 3. Backend API Route
-Create the file `app/api/chat/route.ts`. This keeps your API key secure.
+### 2. Backend API Route (Local CLI Integration)
+Create the file `app/api/chat/route.ts`. This script takes the chat history, formats it, and pipes it into your local `claude` CLI command.
 
 ```typescript
 import { NextResponse } from 'next/server';
-import Anthropic from '@anthropic-ai/sdk';
-
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-});
+import { spawn } from 'child_process';
 
 export async function POST(req: Request) {
   try {
     const { messages } = await req.json();
 
-    const response = await anthropic.messages.create({
-      model: 'claude-3-5-sonnet-20240620', // Or the latest model
-      max_tokens: 4096,
-      messages: messages,
-      system: "You are a helpful assistant.",
-    });
+    // Format the conversation history for the CLI prompt
+    const prompt = messages
+      .map((m: { role: string, content: string }) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
+      .join('\n\n') + '\n\nAssistant:';
 
-    return NextResponse.json({ message: response.content[0].text });
+    return new Promise((resolve) => {
+      // Spawn the local claude CLI. 
+      // The -p flag tells it to read from stdin (the prompt we write to it).
+      const claudeProcess = spawn('claude', ['-p', '--output-format', 'text']);
+      
+      let output = '';
+      let errorOutput = '';
+
+      claudeProcess.stdout.on('data', (data) => {
+        output += data.toString();
+      });
+
+      claudeProcess.stderr.on('data', (data) => {
+        errorOutput += data.toString();
+      });
+
+      claudeProcess.on('close', (code) => {
+        if (code !== 0) {
+          console.error('CLI Error:', errorOutput);
+          resolve(NextResponse.json({ error: 'Error executing local Claude CLI' }, { status: 500 }));
+        } else {
+          resolve(NextResponse.json({ message: output.trim() }));
+        }
+      });
+
+      // Write the prompt to the CLI's standard input
+      claudeProcess.stdin.write(prompt);
+      claudeProcess.stdin.end();
+    });
   } catch (error) {
     console.error(error);
-    return NextResponse.json({ error: 'Error connecting to Claude' }, { status: 500 });
+    return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });
   }
 }
 ```
 
-### 4. Main Chat Interface
+### 3. Main Chat Interface
 Replace the contents of `app/page.tsx` with this code:
 
 ```tsx
@@ -92,7 +113,7 @@ export default function ChatUI() {
   const [isLoading, setIsLoading] = useState(false);
 
   const sendMessage = async () => {
-    if (!input.trim()) return;
+    if (!input.trim() || isLoading) return;
 
     const newMessages = [...messages, { role: 'user', content: input }];
     setMessages(newMessages);
@@ -106,9 +127,13 @@ export default function ChatUI() {
         body: JSON.stringify({ messages: newMessages }),
       });
       const data = await res.json();
+      
+      if (data.error) throw new Error(data.error);
+      
       setMessages([...newMessages, { role: 'assistant', content: data.message }]);
     } catch (error) {
       console.error(error);
+      setMessages([...newMessages, { role: 'assistant', content: "⚠️ Error connecting to local Claude CLI. Make sure the `claude` command is available in your PATH." }]);
     } finally {
       setIsLoading(false);
     }
@@ -139,7 +164,9 @@ export default function ChatUI() {
                 animate={{ opacity: 1 }}
                 className={`flex gap-4 ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
               >
-                {msg.role === 'assistant' && <div className="w-8 h-8 rounded-full bg-[#D97757] flex items-center justify-center text-white text-xs">✺</div>}
+                {msg.role === 'assistant' && (
+                  <div className="w-8 h-8 rounded-full bg-[#D97757] flex items-center justify-center text-white text-xs shrink-0">✺</div>
+                )}
                 <div className={`max-w-[80%] rounded-2xl p-4 ${msg.role === 'user' ? 'bg-gray-200' : 'bg-transparent'}`}>
                   <ReactMarkdown className="prose prose-sm md:prose-base prose-pre:bg-gray-800 prose-pre:text-white">
                     {msg.content}
@@ -147,7 +174,16 @@ export default function ChatUI() {
                 </div>
               </motion.div>
             ))}
-            {isLoading && <div className="text-gray-500 animate-pulse">Claude is thinking...</div>}
+            {isLoading && (
+              <motion.div 
+                initial={{ opacity: 0 }} 
+                animate={{ opacity: 1 }} 
+                className="flex gap-4 justify-start"
+              >
+                <div className="w-8 h-8 rounded-full bg-[#D97757] flex items-center justify-center text-white text-xs shrink-0">✺</div>
+                <div className="text-gray-500 animate-pulse flex items-center">Claude Code is thinking...</div>
+              </motion.div>
+            )}
           </div>
         )}
 
@@ -168,7 +204,7 @@ export default function ChatUI() {
               </div>
               <div className="flex items-center gap-3">
                 <button className="flex items-center gap-1 text-sm text-gray-500 hover:text-gray-800">
-                  Opus 4.6 Extended <ChevronDown size={14}/>
+                  Local CLI <ChevronDown size={14}/>
                 </button>
                 <button 
                   onClick={sendMessage}
@@ -196,7 +232,7 @@ export default function ChatUI() {
 }
 ```
 
-### 5. Sidebar Component
+### 4. Sidebar Component
 Create a `components` folder, and inside it, create `Sidebar.tsx`:
 
 ```tsx
@@ -204,7 +240,7 @@ import { Plus, Search, MessageSquare, Folder, LayoutTemplate, Code, Settings } f
 
 export function Sidebar() {
   return (
-    <div className="w-[260px] bg-[#F5F5F4] border-r border-gray-200 flex flex-col h-full p-4">
+    <div className="w-[260px] bg-[#F5F5F4] border-r border-gray-200 flex flex-col h-full p-4 shrink-0">
       <div className="flex items-center justify-between mb-6">
         <h2 className="font-semibold text-gray-800">Claude</h2>
         <button className="p-1.5 hover:bg-gray-200 rounded-md"><LayoutTemplate size={16}/></button>
@@ -241,14 +277,15 @@ export function Sidebar() {
 }
 ```
 
-### 6. Run the App
+### 5. Run the App
 Start your local server:
 ```bash
 npm run dev
 ```
-Open `http://localhost:3000` in your browser to interact with your local Claude UI.
+Open `http://localhost:3000` in your browser. The interface will now use your local Claude Code installation to generate responses, entirely free of API key requirements.
 
 ---
 
-## Note on "Cowork" (Agent Mode)
-The first image shows an agentic mode ("Cowork") handling background tasks. The code above builds the standard chat UI (second image). To achieve the "Cowork" agentic behavior, you would need to implement **Anthropic Tool Calling** in the API route to allow Claude to execute functions locally, which requires a more advanced backend setup.
+## Troubleshooting & Notes
+- **Command Not Found:** If you get an error when sending a message, ensure the `claude` command is globally accessible in your system's PATH. You can verify this by running `which claude` (Mac/Linux) or `where claude` (Windows) in your terminal.
+- **Formatting:** The `--output-format text` flag ensures the CLI returns clean text that `react-markdown` can parse properly without ANSI terminal color codes.
